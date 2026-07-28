@@ -1,0 +1,9 @@
+node_modules/
+out/
+dist/
+graphify-out/
+backend/.venv/
+__pycache__/
+.env
+.env.*
+!.env.example

@@ -1,0 +1,102 @@
+{
+  "name": "systemic",
+  "displayName": "Systemic",
+  "description": "Systemic VS Code extension",
+  "version": "0.0.1",
+  "publisher": "noahstokes",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "systemic",
+          "title": "Systemic",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "systemic": [
+        {
+          "id": "systemic.chatView",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "systemic.openPanel",
+        "title": "Systemic: Open Panel"
+      },
+      {
+        "command": "systemic.setApiKey",
+        "title": "Systemic: Set OpenRouter API Key"
+      },
+      {
+        "command": "systemic.restartBackend",
+        "title": "Systemic: Restart Backend"
+      },
+      {
+        "command": "systemic.newChat",
+        "title": "Systemic: New Chat"
+      }
+    ],
+    "configuration": {
+      "title": "Systemic",
+      "properties": {
+        "systemic.chatModel": {
+          "type": "string",
+          "default": "moonshotai/kimi-k2.5",
+          "description": "OpenRouter model for chat. Suggested: Kimi K2.5, Claude Sonnet 5 or Haiku 4.5, GPT-5.1, Gemini 3 Pro/Flash Preview, or DeepSeek V3.2; custom model IDs are accepted."
+        },
+        "systemic.workerModel": {
+          "type": "string",
+          "default": "moonshotai/kimi-k2.5",
+          "description": "OpenRouter model for design-pipeline workers. Custom model IDs are accepted."
+        },
+        "systemic.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python executable for the backend. Empty uses backend/.venv/bin/python, then python3."
+        },
+        "systemic.port": {
+          "type": "integer",
+          "default": 8321,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "Local port used by the Systemic backend."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run typecheck && node esbuild.js --production",
+    "build:dev": "node esbuild.js",
+    "compile": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "watch": "node esbuild.js --watch",
+    "test": "node --experimental-strip-types --test src/**/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.12",
+    "marked": "^18.0.7",
+    "mermaid": "^11.16.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  }
+}
