@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator, Callable
+from threading import Event
 from typing import TypeVar
 
 from langchain.agents import create_agent
@@ -93,8 +94,15 @@ async def _run_pipeline(
     ToolInvocationError) and which would otherwise tear down the whole chat
     graph. Report the failure back to the model as text so the turn survives.
     """
+    cancel_event = Event()
     try:
-        result = await asyncio.to_thread(solve, problem, qa=qa, progress=progress)
+        result = await asyncio.to_thread(
+            solve,
+            problem,
+            qa=qa,
+            progress=progress,
+            cancel_event=cancel_event,
+        )
         sink.append(result)
         if result.get("questions"):
             return (
@@ -103,6 +111,9 @@ async def _run_pipeline(
                 "text and end the turn."
             )
         return "The design options are ready and visible to the user."
+    except asyncio.CancelledError:
+        cancel_event.set()
+        raise
     except Exception as exc:
         log.exception("design pipeline failed")
         return (
@@ -227,7 +238,7 @@ async def chat_stream(
 
 
 async def _check_pipeline_failure_is_text() -> None:
-    def boom(_problem, qa=None, progress=None):
+    def boom(_problem, qa=None, progress=None, cancel_event=None):
         raise RecursionError("Recursion limit of 40 reached")
 
     # patch this module's own globals: run as __main__ it is a different module
@@ -246,7 +257,7 @@ async def _check_pipeline_failure_is_text() -> None:
 
 
 async def _check_repeated_progress_emits_one_status() -> None:
-    def slow_solve(problem, qa=None, progress=None):
+    def slow_solve(problem, qa=None, progress=None, cancel_event=None):
         for _ in range(2):
             progress("Reviewing approaches…")
             time.sleep(0.05)  # long enough for the heartbeat to fire
@@ -278,7 +289,7 @@ async def _check_repeated_progress_emits_one_status() -> None:
 
 
 async def _check_pipeline_questions_suppress_assistant_echo() -> None:
-    def ask(_problem, qa=None, progress=None):
+    def ask(_problem, qa=None, progress=None, cancel_event=None):
         return {"questions": ["What scale?"]}
 
     class FakeAgent:
@@ -321,6 +332,52 @@ async def _check_heartbeat() -> None:
     await stream.aclose()
 
 
+async def _check_chat_stream_cancellation_stops_worker() -> None:
+    started = Event()
+    stopped = Event()
+
+    def waiting_solve(problem, qa=None, progress=None, cancel_event=None):
+        started.set()
+        while not cancel_event.is_set():
+            time.sleep(0.001)
+        stopped.set()
+        return {"options": [], "comparison": {}, "evidence": [], "sources": []}
+
+    class FakeAgent:
+        def __init__(self, tools):
+            self.tool = next(t for t in tools if t.name == "design_solution")
+
+        async def astream(self, _state, stream_mode=None):
+            call = {"name": "design_solution", "args": {"problem": "p"}, "id": "1"}
+            yield ("updates", {"agent": {"messages": [AIMessage("", tool_calls=[call])]}})
+            await self.tool.ainvoke({"problem": "p"})
+            yield ("updates", {"tools": {}})
+
+    g = globals()
+    original = (g["solve"], g["create_agent"])
+    g["solve"] = waiting_solve
+    g["create_agent"] = lambda **kw: FakeAgent(kw["tools"])
+    stream = chat_stream("design it")
+    assert (await anext(stream))["type"] == "status"
+    pending = asyncio.create_task(anext(stream))
+    try:
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        pending.cancel()
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+        await stream.aclose()
+        for _ in range(100):
+            if stopped.is_set():
+                break
+            await asyncio.sleep(0.001)
+    finally:
+        g["solve"], g["create_agent"] = original
+    assert stopped.is_set(), "worker did not receive cancellation"
+
+
 if __name__ == "__main__":
     assert _text("hello") == "hello"
     assert _text([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]) == "ab"
@@ -330,6 +387,7 @@ if __name__ == "__main__":
     assert _assistant_text(ToolMessage(content="1:file line", tool_call_id="x")) == ""
     assert _status({"name": "read_file", "args": {"path": "src/app.ts"}}) == "Reading src/app.ts…"
     asyncio.run(_check_heartbeat())
+    asyncio.run(_check_chat_stream_cancellation_stops_worker())
     asyncio.run(_check_pipeline_failure_is_text())
     asyncio.run(_check_repeated_progress_emits_one_status())
     asyncio.run(_check_pipeline_questions_suppress_assistant_echo())

@@ -30,7 +30,11 @@ async def chat_endpoint(request: ChatRequest) -> StreamingResponse:
     history = [h.model_dump() for h in request.history]
 
     async def ndjson():
-        async for event in chat_stream(request.message, history):
-            yield json.dumps(event, ensure_ascii=False) + "\n"
+        stream = chat_stream(request.message, history)
+        try:
+            async for event in stream:
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        finally:
+            await stream.aclose()
 
     return StreamingResponse(ndjson(), media_type="application/x-ndjson")

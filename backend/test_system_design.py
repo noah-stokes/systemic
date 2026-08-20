@@ -4,6 +4,11 @@ Agent calls are stubbed — no API traffic. Run from backend/:
     python test_system_design.py
 """
 
+import subprocess
+import tempfile
+from pathlib import Path
+from threading import Event
+
 import ai.system_design as orch
 
 CTX = orch.ContextReport(
@@ -79,6 +84,83 @@ def test_grep_defaults_to_every_file():
     assert "test_system_design.py:" in hit, hit
 
 
+def test_repo_tools_exclude_ignored_secrets_vendors_and_private_keys():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "src").mkdir()
+        (root / "vendor").mkdir()
+        (root / "src" / "app.py").write_text("VISIBLE_SOURCE = True\n")
+        (root / ".gitignore").write_text("*.ignored\n")
+        (root / "debug.ignored").write_text("IGNORED_VALUE\n")
+        (root / ".env.local").write_text("TOKEN=secret\n")
+        (root / "credentials.json").write_text('{"token":"secret"}\n')
+        (root / "vendor" / "bundle.js").write_text("VENDORED_VALUE\n")
+        (root / "notes.txt").write_text(
+            "-----BEGIN OPENSSH "
+            + "PRIVATE KEY-----\nPRIVATE_VALUE\n-----END OPENSSH "
+            + "PRIVATE KEY-----\n"
+        )
+        (root / "late-key.txt").write_text(
+            "x" * 20_000
+            + "-----BEGIN "
+            + "PRIVATE KEY-----\nLATE_PRIVATE_VALUE\n"
+        )
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "add", "src/app.py"], cwd=root, check=True)
+        subprocess.run(["git", "add", "-f", "debug.ignored"], cwd=root, check=True)
+
+        original = orch.REPO_ROOT
+        original_structured = orch._structured
+        original_contains_private_key = orch._contains_private_key
+        orch.REPO_ROOT = root.resolve()
+        try:
+            def unexpected_content_scan(*_args):
+                raise AssertionError("file listing scanned repository contents")
+
+            orch._contains_private_key = unexpected_content_scan
+            listing = orch.glob_files.invoke({"pattern": "**/*"})
+            orch._contains_private_key = original_contains_private_key
+            assert "src/app.py" in listing, listing
+            for hidden in (
+                "debug.ignored",
+                ".env.local",
+                "credentials.json",
+                "vendor/bundle.js",
+            ):
+                assert hidden not in listing, listing
+                assert orch.read_file.invoke({"path": hidden}).startswith("Error:")
+            assert "notes.txt" in listing, listing
+            assert orch.read_file.invoke({"path": "notes.txt"}).startswith("Error:")
+            assert "late-key.txt" in listing, listing
+            assert orch.read_file.invoke({"path": "late-key.txt"}).startswith("Error:")
+            assert "VISIBLE_SOURCE" in orch.read_file.invoke({"path": "src/app.py"})
+            assert orch.grep.invoke({"pattern": "PRIVATE_VALUE"}) == "No matches."
+            assert orch.grep.invoke({"pattern": "LATE_PRIVATE_VALUE"}) == "No matches."
+
+            captured = {}
+
+            def fake_structured(agent, text, recursion_limit=40):
+                captured["prompt"] = text
+                return CTX
+
+            orch._structured = fake_structured
+            orch.get_context("inspect the repo")
+            prompt = captured["prompt"]
+            assert "src/app.py" in prompt, prompt
+            for hidden in (
+                "debug.ignored",
+                ".env.local",
+                "credentials.json",
+                "vendor/bundle.js",
+            ):
+                assert hidden not in prompt, prompt
+            assert "PRIVATE_VALUE" not in prompt, prompt
+        finally:
+            orch.REPO_ROOT = original
+            orch._structured = original_structured
+            orch._contains_private_key = original_contains_private_key
+
+
 def test_structured_requires_a_structured_response():
     class Agent:
         def invoke(self, *_args):
@@ -92,11 +174,44 @@ def test_structured_requires_a_structured_response():
         raise AssertionError("missing structured response was accepted")
 
 
+def test_structured_honors_cancellation_before_model_call():
+    class Agent:
+        def invoke(self, *_args):
+            raise AssertionError("cancelled model call was launched")
+
+    cancelled = Event()
+    cancelled.set()
+    try:
+        orch._structured(Agent(), "problem", cancel_event=cancelled)
+    except orch.PipelineCancelled:
+        pass
+    else:
+        raise AssertionError("cancelled pipeline continued")
+
+
+def test_structured_cancellation_callback_stops_followup_model_call():
+    cancelled = Event()
+
+    class Agent:
+        def invoke(self, _state, config):
+            cancelled.set()
+            config["callbacks"][0].on_chat_model_start()
+            raise AssertionError("cancelled followup call was launched")
+
+    try:
+        orch._structured(Agent(), "problem", cancel_event=cancelled)
+    except orch.PipelineCancelled:
+        pass
+    else:
+        raise AssertionError("cancelled agent graph continued")
+
+
 def test_openrouter_tool_choice_is_compatible():
     model = orch._model(orch.MODEL)
     bound = model.bind_tools([orch.read_file], tool_choice="any")
     assert bound.kwargs["tool_choice"] == "required"
     assert "provider" not in model.extra_body
+    assert model.openai_api_base == orch.OPENROUTER_BASE_URL
 
 
 def test_get_options_keeps_keys_when_one_worker_fails():
@@ -267,6 +382,30 @@ def test_solve_short_circuits_on_unanswered_questions():
     assert result["evidence"] == ["file.py:1-2"]
 
 
+def test_solve_cancellation_stops_before_next_stage():
+    cancelled = Event()
+
+    def fake_context(problem, qa=None, prior=None, cancel_event=None):
+        cancelled.set()
+        return CTX
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("paid stage launched after cancellation")
+
+    orig = (orch.get_context, orch.get_options)
+    orch.get_context = fake_context
+    orch.get_options = boom
+    try:
+        try:
+            orch.solve("problem", cancel_event=cancelled)
+        except orch.PipelineCancelled:
+            pass
+        else:
+            raise AssertionError("cancelled pipeline continued")
+    finally:
+        orch.get_context, orch.get_options = orig
+
+
 def test_solve_with_answers_runs_the_pipeline():
     asked = CTX.model_copy(update={"questions": ["what scale?"]})
     seen = {}
@@ -323,13 +462,17 @@ if __name__ == "__main__":
     test_map_stage_total_failure_reports_the_cause()
     test_glob_expands_braces_and_rejects_extglob()
     test_grep_defaults_to_every_file()
+    test_repo_tools_exclude_ignored_secrets_vendors_and_private_keys()
     test_structured_requires_a_structured_response()
+    test_structured_honors_cancellation_before_model_call()
+    test_structured_cancellation_callback_stops_followup_model_call()
     test_openrouter_tool_choice_is_compatible()
     test_get_options_keeps_keys_when_one_worker_fails()
     test_get_options_revises_only_failing_keys()
     test_dedupe_groups_merges_and_partitions()
     test_summarize_pairs_option_with_its_own_review()
     test_solve_short_circuits_on_unanswered_questions()
+    test_solve_cancellation_stops_before_next_stage()
     test_solve_with_answers_runs_the_pipeline()
     test_solve_returns_best_round_not_last()
     test_solve_survives_comparator_and_summarizer_failure()

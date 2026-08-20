@@ -13,11 +13,14 @@ import re
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
+from threading import Event
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
@@ -28,6 +31,9 @@ log = logging.getLogger(__name__)
 
 MODEL = os.getenv("WORKER_MODEL", "moonshotai/kimi-k2.5")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = os.getenv(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+)
 REPO_ROOT = Path(os.getenv("REPO_ROOT", ".")).resolve()
 REVIEW_BAR = 7
 
@@ -53,7 +59,7 @@ OPTION_OBJECTIVES = {
 def _model(model_id: str) -> ChatOpenAI:
     return ChatOpenAI(
         model=model_id,
-        base_url="https://openrouter.ai/api/v1",
+        base_url=OPENROUTER_BASE_URL,
         api_key=OPENROUTER_KEY,
         max_retries=2,
         extra_body={
@@ -62,7 +68,72 @@ def _model(model_id: str) -> ChatOpenAI:
     )
 
 
-IGNORE_DIRS = {".venv", "venv", "node_modules", ".git", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build"}
+IGNORE_DIRS = {
+    ".aws",
+    ".git",
+    ".gnupg",
+    ".mypy_cache",
+    ".next",
+    ".pytest_cache",
+    ".ssh",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "deriveddata",
+    "dist",
+    "node_modules",
+    "out",
+    "pods",
+    "target",
+    "vendor",
+    "venv",
+}
+SECRET_NAMES = {
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials.json",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+    "service-account.json",
+}
+SECRET_SUFFIXES = {
+    ".jks",
+    ".key",
+    ".keystore",
+    ".p12",
+    ".pem",
+    ".pfx",
+    ".tfstate",
+}
+PRIVATE_KEY_MARKER = re.compile(br"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----")
+
+
+class PipelineCancelled(RuntimeError):
+    """Raised in the worker thread after its caller stops the request."""
+
+
+def _raise_if_cancelled(cancel_event: Event | None) -> None:
+    if cancel_event and cancel_event.is_set():
+        raise PipelineCancelled("design pipeline cancelled")
+
+
+class _CancelHandler(BaseCallbackHandler):
+    """Stop an agent graph before it starts another paid model call."""
+
+    raise_error = True
+
+    def __init__(self, cancel_event: Event):
+        self.cancel_event = cancel_event
+
+    def on_chat_model_start(self, *_args, **_kwargs) -> None:
+        _raise_if_cancelled(self.cancel_event)
+
+    def on_llm_start(self, *_args, **_kwargs) -> None:
+        _raise_if_cancelled(self.cancel_event)
 
 
 def _safe(path: str) -> Path:
@@ -73,15 +144,108 @@ def _safe(path: str) -> Path:
     return p
 
 
-def _visible(p: Path) -> bool:
-    """A real file inside the sandbox, not in a vendored/build dir. Keeps the
-    glob/grep tools on source only — git ls-files already excludes these, but
-    these tools walk the raw filesystem."""
-    return (
-        p.is_file()
-        and p.resolve().is_relative_to(REPO_ROOT)
-        and not any(part in IGNORE_DIRS for part in p.relative_to(REPO_ROOT).parts)
+@lru_cache(maxsize=8192)
+def _contains_private_key(p: Path, _size: int, _mtime_ns: int) -> bool:
+    """Cache content classification until the file changes."""
+    try:
+        with p.open("rb") as file:
+            content = file.read()
+    except OSError:
+        return True
+    return bool(
+        PRIVATE_KEY_MARKER.search(content)
+        or content.startswith(b"PuTTY-User-Key-File-")
     )
+
+
+def _sensitive_path(p: Path) -> bool:
+    """Recognize sensitive paths without opening their files."""
+    rel = p.relative_to(REPO_ROOT)
+    parts = [part.lower() for part in rel.parts]
+    name = parts[-1]
+    if any(part in IGNORE_DIRS for part in parts[:-1]):
+        return True
+    if name == ".env" or name.startswith(".env."):
+        return True
+    if name in SECRET_NAMES or p.suffix.lower() in SECRET_SUFFIXES:
+        return True
+    return False
+
+
+def _git_ignored_paths(paths: list[Path]) -> set[Path]:
+    """Use Git's own ignore rules, including nested and global excludes."""
+    if not paths:
+        return set()
+    relative = [str(path.relative_to(REPO_ROOT)) for path in paths]
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--no-index", "-z", "--stdin"],
+            cwd=REPO_ROOT,
+            input="\0".join(relative) + "\0",
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if result.returncode not in (0, 1):
+        return set()
+    ignored = {path for path in result.stdout.split("\0") if path}
+    return {
+        path for path, rel in zip(paths, relative) if rel in ignored
+    }
+
+
+def _visible(
+    p: Path,
+    check_git_ignore: bool = True,
+    check_private_key: bool = True,
+) -> bool:
+    """A readable, non-sensitive source file inside the repository boundary."""
+    p = p.resolve()
+    if not p.is_file() or not p.is_relative_to(REPO_ROOT) or _sensitive_path(p):
+        return False
+    if check_git_ignore and p in _git_ignored_paths([p]):
+        return False
+    if not check_private_key:
+        return True
+    try:
+        stat = p.stat()
+    except OSError:
+        return False
+    return not _contains_private_key(p, stat.st_size, stat.st_mtime_ns)
+
+
+def _git_repo_files() -> list[Path] | None:
+    """Return tracked and unignored untracked files, or None outside Git."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    files = []
+    for path in result.stdout.split("\0"):
+        if not path:
+            continue
+        try:
+            candidate = _safe(path)
+        except ValueError:
+            continue
+        if _visible(
+            candidate,
+            check_git_ignore=False,
+            check_private_key=False,
+        ):
+            files.append(candidate)
+    ignored = _git_ignored_paths(files)
+    return [path for path in files if path not in ignored]
 
 
 _EXTGLOB = re.compile(r"[?*+@!]\(")
@@ -111,8 +275,16 @@ def _glob(pattern: str) -> list[Path]:
             f"unsupported glob syntax {pattern!r} — use braces "
             '("**/*.{ts,tsx}"), not extglob ("**/*.ts?(x)")'
         )
-    hits = {p for pat in _expand_braces(pattern) for p in REPO_ROOT.glob(pat)}
-    return sorted(p for p in hits if _visible(p))
+    hits = {
+        p.resolve()
+        for pat in _expand_braces(pattern)
+        for p in REPO_ROOT.glob(pat)
+    }
+    repo_files = _git_repo_files()
+    if repo_files is not None:
+        hits.intersection_update(repo_files)
+        return sorted(hits)
+    return sorted(p for p in hits if _visible(p, check_private_key=False))
 
 
 @tool
@@ -122,7 +294,10 @@ def read_file(path: str, start: int = 1, end: int = 400) -> str:
     with its line number as `N:text`. Default window is the first 400 lines;
     call again with a higher `start` to read further."""
     try:
-        lines = _safe(path).read_text(errors="replace").splitlines()
+        p = _safe(path)
+        if not _visible(p):
+            raise PermissionError("file is ignored or sensitive")
+        lines = p.read_text(errors="replace").splitlines()
         chunk = lines[max(start, 1) - 1 : end]
         if not chunk:
             return f"Error: no lines in range {start}-{end} (file has {len(lines)} lines)"
@@ -157,6 +332,8 @@ def grep(pattern: str, glob: str = "**/*") -> str:
         rx = re.compile(pattern)
         hits = []
         for p in _glob(glob):
+            if not _visible(p, check_git_ignore=False):
+                continue
             try:
                 text = p.read_text(errors="replace")
             except OSError:
@@ -311,17 +488,28 @@ research_agent = create_agent(
 )
 
 
-def _structured(agent, text: str, recursion_limit: int = 40):
+def _structured(
+    agent,
+    text: str,
+    recursion_limit: int = 40,
+    cancel_event: Event | None = None,
+):
+    _raise_if_cancelled(cancel_event)
+    config = {"recursion_limit": recursion_limit}
+    if cancel_event:
+        config["callbacks"] = [_CancelHandler(cancel_event)]
     result = agent.invoke(
         {"messages": [{"role": "user", "content": text}]},
-        {"recursion_limit": recursion_limit},
+        config,
     )
     if "structured_response" not in result:
         raise RuntimeError("model returned no structured response")
     return result["structured_response"]
 
 
-def _map_stage(fn, items: list, stage: str) -> list:
+def _map_stage(
+    fn, items: list, stage: str, cancel_event: Event | None = None
+) -> list:
     """Map fn over items in parallel, preserving slots: a failed call yields
     None in its position so callers keep alignment with their keys. Raise only
     if every call failed."""
@@ -329,8 +517,11 @@ def _map_stage(fn, items: list, stage: str) -> list:
     errors: list[Exception] = []
 
     def _worker(item):
+        _raise_if_cancelled(cancel_event)
         try:
             return fn(item)
+        except PipelineCancelled:
+            raise
         except Exception as exc:
             log.exception("%s: worker failed", stage)
             errors.append(exc)
@@ -338,8 +529,10 @@ def _map_stage(fn, items: list, stage: str) -> list:
 
     if not items:
         return []
+    _raise_if_cancelled(cancel_event)
     with ThreadPoolExecutor(max_workers=len(items)) as pool:
         results = list(pool.map(_worker, items))
+    _raise_if_cancelled(cancel_event)
     if all(r is None for r in results):
         # chain the first cause: the message reaches the user, and "all 3 calls
         # failed" alone says nothing about why.
@@ -376,6 +569,7 @@ def get_context(
     problem: str,
     qa: list[str] | None = None,
     prior: ContextReport | None = None,
+    cancel_event: Event | None = None,
 ) -> ContextReport:
     """Run context_explorer on problem, primed with a repo file listing.
 
@@ -383,18 +577,10 @@ def get_context(
     ("Q: ... A: ..."); prior passes the previous report so the explorer
     updates it instead of re-exploring from scratch.
     """
-    try:
-        files = subprocess.run(
-            ["git", "ls-files"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        ).stdout.splitlines()
-    except (OSError, subprocess.SubprocessError):
-        files = []
+    files = _git_repo_files() or []
     if files:
-        listing = "\n".join(files[:200])
+        relative = [str(path.relative_to(REPO_ROOT)) for path in files]
+        listing = "\n".join(relative[:200])
         if len(files) > 200:
             listing += f"\n... truncated, {len(files) - 200} more"
         problem = f"Repo files:\n{listing}\n\nRequest:\n{problem}"
@@ -405,20 +591,25 @@ def get_context(
         )
     if qa:
         problem += "\n\nUser answered these clarifying questions:\n" + "\n".join(qa)
-    return _structured(context_explorer, problem)
+    kwargs = {"cancel_event": cancel_event} if cancel_event else {}
+    return _structured(context_explorer, problem, **kwargs)
 
 
-def get_research(context: ContextReport) -> ResearchReport:
+def get_research(
+    context: ContextReport, cancel_event: Event | None = None
+) -> ResearchReport:
     """Run research_agent on the context report's flagged research topics."""
     topics = "\n".join(f"- {t}" for t in context.research_topics)
     prompt = f"{context.model_dump_json()}\n\nResearch these topics:\n{topics}"
-    return _structured(research_agent, prompt, recursion_limit=15)
+    kwargs = {"cancel_event": cancel_event} if cancel_event else {}
+    return _structured(research_agent, prompt, recursion_limit=15, **kwargs)
 
 
 def get_options(
     context: ContextReport,
     prior: dict[str, tuple[ImplementationOption, OptionReview]] | None = None,
     research: ResearchReport | None = None,
+    cancel_event: Event | None = None,
 ) -> dict[str, ImplementationOption]:
     """Run option_explorer once per objective in OPTION_OBJECTIVES, in parallel.
 
@@ -451,20 +642,28 @@ def get_options(
             )
         # default recursion_limit: the explorer verifies files with READ_TOOLS,
         # and a tighter budget kills every worker at once with GraphRecursionError.
+        kwargs = {"cancel_event": cancel_event} if cancel_event else {}
         return _structured(
             option_explorer,
             f"{context.model_dump_json()}{research_ctx}\n\n"
             f"Objective:\n{OPTION_OBJECTIVES[key]}{critique}",
+            **kwargs,
         )
 
     keys = list(prior) if prior else list(OPTION_OBJECTIVES)
     return {
-        k: o for k, o in zip(keys, _map_stage(_one, keys, "get_options")) if o is not None
+        k: o
+        for k, o in zip(
+            keys, _map_stage(_one, keys, "get_options", cancel_event=cancel_event)
+        )
+        if o is not None
     }
 
 
 def review_options(
-    context: ContextReport, options: dict[str, ImplementationOption]
+    context: ContextReport,
+    options: dict[str, ImplementationOption],
+    cancel_event: Event | None = None,
 ) -> dict[str, OptionReview]:
     """Run reviewer on each option in parallel, keyed by objective."""
     keys = list(options)
@@ -474,9 +673,11 @@ def review_options(
             f"Context:\n{context.model_dump_json()}\n\n"
             f"Objective:\n{OPTION_OBJECTIVES[k]}\n\n"
             f"Option:\n{options[k].model_dump_json()}",
+            **({"cancel_event": cancel_event} if cancel_event else {}),
         ),
         keys,
         "review_options",
+        cancel_event=cancel_event,
     )
     return {k: r for k, r in zip(keys, results) if r is not None}
 
@@ -524,6 +725,7 @@ def summarize_options(
     context: ContextReport,
     options: dict[str, ImplementationOption],
     reviews: dict[str, OptionReview],
+    cancel_event: Event | None = None,
 ) -> dict[str, OptionSummary]:
     """Run summarizer on each option/review pair in parallel, keyed by objective."""
     keys = [k for k in options if k in reviews]
@@ -533,9 +735,11 @@ def summarize_options(
             f"Context:\n{context.model_dump_json()}\n\n"
             f"Option:\n{options[k].model_dump_json()}\n\n"
             f"Review:\n{reviews[k].model_dump_json()}",
+            **({"cancel_event": cancel_event} if cancel_event else {}),
         ),
         keys,
         "summarize_options",
+        cancel_event=cancel_event,
     )
     return {k: s for k, s in zip(keys, results) if s is not None}
 
@@ -594,6 +798,7 @@ def solve(
     max_rounds: int = 2,
     qa: list[str] | None = None,
     progress: Callable[[str], None] | None = None,
+    cancel_event: Event | None = None,
 ) -> dict:
     """Run the pipeline deterministically.
 
@@ -612,8 +817,11 @@ def solve(
     boundary.
     """
     say = progress or (lambda _stage: None)
+    kwargs = {"cancel_event": cancel_event} if cancel_event else {}
+    _raise_if_cancelled(cancel_event)
     say("Exploring the codebase…")
-    context = get_context(problem, qa=qa)
+    context = get_context(problem, qa=qa, **kwargs)
+    _raise_if_cancelled(cancel_event)
     if not qa and context.questions:
         return {
             "questions": context.questions,
@@ -628,11 +836,14 @@ def solve(
     research = None
     if context.research_needed and context.research_topics:
         say("Researching current practice…")
-        research = get_research(context)
+        research = get_research(context, **kwargs)
+        _raise_if_cancelled(cancel_event)
     say(f"Drafting {len(OPTION_OBJECTIVES)} approaches…")
-    options = get_options(context, research=research)
+    options = get_options(context, research=research, **kwargs)
+    _raise_if_cancelled(cancel_event)
     say("Reviewing approaches…")
-    reviews = review_options(context, options)
+    reviews = review_options(context, options, **kwargs)
+    _raise_if_cancelled(cancel_event)
     best_options, best_reviews = dict(options), dict(reviews)
     for round_no in range(2, max_rounds + 1):
         # failing: below the bar, OR generated but never successfully reviewed
@@ -650,13 +861,15 @@ def solve(
         # forward unchanged to be re-reviewed. best_* is only for presentation.
         to_revise = {k: (options[k], reviews[k]) for k in failing if k in reviews}
         revised = (
-            get_options(context, prior=to_revise, research=research)
+            get_options(context, prior=to_revise, research=research, **kwargs)
             if to_revise
             else {}
         )
         carried = {k: best_options[k] for k in failing if k not in revised}
         options = {**carried, **revised}
-        reviews = review_options(context, options)
+        _raise_if_cancelled(cancel_event)
+        reviews = review_options(context, options, **kwargs)
+        _raise_if_cancelled(cancel_event)
         for k, r in reviews.items():
             if k not in best_reviews or r.score > best_reviews[k].score:
                 best_options[k], best_reviews[k] = options[k], r
@@ -676,6 +889,7 @@ def solve(
     # its own, so degrade to one card per option rather than dropping the work.
     say("Comparing approaches…")
     try:
+        _raise_if_cancelled(cancel_event)
         comparison = _structured(
             comparator,
             f"Context:\n{context.model_dump_json()}\n\n"
@@ -685,9 +899,12 @@ def solve(
                 for k in best_options
                 if k in best_reviews
             ),
+            **kwargs,
         )
         comparison_data = comparison.model_dump()
         groups = _dedupe_groups(comparison.duplicate_groups, list(best_options))
+    except PipelineCancelled:
+        raise
     except Exception:
         log.exception("comparator failed; presenting options uncompared")
         comparison_data = {}
@@ -698,7 +915,11 @@ def solve(
     # and lose the options, comparison, and evidence already paid for.
     say("Writing up options…")
     try:
-        summaries = summarize_options(context, survivors, survivor_reviews)
+        summaries = summarize_options(
+            context, survivors, survivor_reviews, **kwargs
+        )
+    except PipelineCancelled:
+        raise
     except Exception:
         log.exception("summarize_options failed; falling back to raw options")
         summaries = {}
